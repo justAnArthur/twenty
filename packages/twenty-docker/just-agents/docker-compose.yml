@@ -1,0 +1,137 @@
+# Twenty for just-agents, as its own Dokploy compose app. See JUST_AGENTS.md.
+# Every variable is set explicitly: Twenty treats an empty string as a set
+# value, so nothing is forwarded that we don't set.
+name: twenty
+
+x-twenty-env: &twenty-env
+  SERVER_URL: https://${TWENTY_DOMAIN:?set TWENTY_DOMAIN}
+  PG_DATABASE_URL: postgres://postgres:${TWENTY_DB_PASSWORD:?set TWENTY_DB_PASSWORD}@db:5432/default
+  REDIS_URL: redis://:${TWENTY_REDIS_PASSWORD:?set TWENTY_REDIS_PASSWORD}@redis:6379
+  ENCRYPTION_KEY: ${TWENTY_ENCRYPTION_KEY:?set TWENTY_ENCRYPTION_KEY}
+  # one workspace; the first sign-up becomes admin and closes sign-up
+  IS_MULTIWORKSPACE_ENABLED: "false"
+
+services:
+  server:
+    image: ghcr.io/justanarthur/twenty:${TWENTY_TAG:-v2.52.0-ja.1}
+    environment: *twenty-env
+    volumes:
+      - server-local-data:/app/packages/twenty-server/.local-storage
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.routers.twenty.rule=Host(`${TWENTY_DOMAIN:?set TWENTY_DOMAIN}`)"
+      - "traefik.http.routers.twenty.entrypoints=websecure"
+      - "traefik.http.routers.twenty.tls=true"
+      - "traefik.http.routers.twenty.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.services.twenty.loadbalancer.server.port=3000"
+    networks: [default, dokploy-network]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: curl --fail http://localhost:3000/healthz
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 1536m
+    restart: always
+
+  worker:
+    image: ghcr.io/justanarthur/twenty:${TWENTY_TAG:-v2.52.0-ja.1}
+    command: ["yarn", "worker:prod"]
+    environment:
+      <<: *twenty-env
+      # the server runs both
+      DISABLE_DB_MIGRATIONS: "true"
+      DISABLE_CRON_JOBS_REGISTRATION: "true"
+    volumes:
+      - server-local-data:/app/packages/twenty-server/.local-storage
+    depends_on:
+      db:
+        condition: service_healthy
+      server:
+        condition: service_healthy
+    mem_limit: 1536m
+    restart: always
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: default
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${TWENTY_DB_PASSWORD:?set TWENTY_DB_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: pg_isready -U postgres -h localhost -d postgres
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: 1g
+    restart: always
+
+  redis:
+    image: redis:7
+    command:
+      - --maxmemory-policy
+      - noeviction
+      - --requirepass
+      - ${TWENTY_REDIS_PASSWORD:?set TWENTY_REDIS_PASSWORD}
+    environment:
+      REDISCLI_AUTH: ${TWENTY_REDIS_PASSWORD:?set TWENTY_REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      # redis-cli exits 0 on an error reply too, so look for the PONG
+      test: redis-cli ping | grep -q PONG
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: 256m
+    restart: always
+
+  # A dump on start, then one a day; keeps the newest 14.
+  backup:
+    image: postgres:16
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGDATABASE: default
+      PGPASSWORD: ${TWENTY_DB_PASSWORD:?set TWENTY_DB_PASSWORD}
+    volumes:
+      - backups:/backups
+    entrypoint:
+      - sh
+      - -c
+      - |
+        while true; do
+          f=/backups/twenty-$$(date -u +%Y%m%d-%H%M%S).dump
+          if pg_dump -Fc -f "$$f.tmp"; then
+            mv "$$f.tmp" "$$f"
+            echo "backup: wrote $$f"
+          else
+            rm -f "$$f.tmp"
+            echo "backup: pg_dump failed" >&2
+          fi
+          ls -1r /backups/twenty-*.dump | tail -n +15 | xargs -r rm -f
+          sleep 86400
+        done
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: 256m
+    restart: always
+
+networks:
+  # Created by the Dokploy installer; Traefik reaches the server through it.
+  dokploy-network:
+    external: true
+
+volumes:
+  db-data:
+  redis-data:
+  server-local-data:
+  backups:
