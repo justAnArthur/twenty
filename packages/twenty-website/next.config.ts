@@ -49,6 +49,8 @@ const nextConfig: LinariaConfig = {
     configFile: path.resolve(__dirname, 'wyw-in-js.config.cjs'),
   },
   experimental: {
+    // persistent dev cache writes GBs to .next/dev/cache; keep off
+    turbopackFileSystemCacheForDev: false,
     swcPlugins: [
       [
         '@lingui/swc-plugin',
